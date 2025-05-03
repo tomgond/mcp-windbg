@@ -1,7 +1,8 @@
 import os
 import traceback
 import glob
-from typing import Dict, Optional, List
+import winreg
+from typing import Dict, Optional
 
 from .cdb_session import CDBSession, CDBError
 
@@ -20,21 +21,33 @@ from pydantic import BaseModel, Field
 # Dictionary to store CDB sessions keyed by dump file path
 active_sessions: Dict[str, CDBSession] = {}
 
+def get_local_dumps_path() -> Optional[str]:
+    """Get the local dumps path from the Windows registry."""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+        ) as key:
+            dump_folder, _ = winreg.QueryValueEx(key, "DumpFolder")
+            if os.path.exists(dump_folder) and os.path.isdir(dump_folder):
+                return dump_folder
+    except (OSError, WindowsError):
+        # Registry key might not exist or other issues
+        pass
+    
+    # Default Windows dump location
+    default_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CrashDumps")
+    if os.path.exists(default_path) and os.path.isdir(default_path):
+        return default_path
+        
+    return None
+
 class OpenWindbgDump(BaseModel):
     """Parameters for analyzing a crash dump."""
     dump_path: str = Field(description="Path to the Windows crash dump file")
-    include_stack_trace: bool = Field(
-        default=True, 
-        description="Whether to include stack traces in the analysis"
-    )
-    include_modules: bool = Field(
-        default=True, 
-        description="Whether to include loaded module information"
-    )
-    include_threads: bool = Field(
-        default=True, 
-        description="Whether to include thread information"
-    )
+    include_stack_trace: bool = Field(description="Whether to include stack traces in the analysis")
+    include_modules: bool = Field(description="Whether to include loaded module information")
+    include_threads: bool = Field(description="Whether to include thread information")
 
 
 class RunWindbgCmdParams(BaseModel):
@@ -50,7 +63,10 @@ class CloseWindbgDumpParams(BaseModel):
 
 class ListWindbgDumpsParams(BaseModel):
     """Parameters for listing crash dumps in a directory."""
-    directory_path: str = Field(description="Directory path to search for .dmp files")
+    directory_path: Optional[str] = Field(
+        default=None,
+        description="Directory path to search for .dmp files. If not specified, will use the configured dump path from registry."
+    )
     recursive: bool = Field(
         default=False,
         description="Whether to search recursively in subdirectories"
@@ -178,6 +194,37 @@ async def serve(
     async def call_tool(name, arguments: dict) -> list[TextContent]:
         try:
             if name == "open_windbg_dump":
+                # Check if dump_path is missing or empty
+                if "dump_path" not in arguments or not arguments.get("dump_path"):
+                    local_dumps_path = get_local_dumps_path()
+                    dumps_found_text = ""
+                    
+                    if local_dumps_path:
+                        # Find dump files in the local dumps directory
+                        search_pattern = os.path.join(local_dumps_path, "*.dmp")
+                        dump_files = glob.glob(search_pattern)
+                        
+                        if dump_files:
+                            dumps_found_text = f"\n\nI found {len(dump_files)} crash dump(s) in {local_dumps_path}:\n\n"
+                            for i, dump_file in enumerate(dump_files[:10]):  # Limit to 10 dumps to avoid clutter
+                                try:
+                                    size_mb = round(os.path.getsize(dump_file) / (1024 * 1024), 2)
+                                except (OSError, IOError):
+                                    size_mb = "unknown"
+                                
+                                dumps_found_text += f"{i+1}. {dump_file} ({size_mb} MB)\n"
+                                
+                            if len(dump_files) > 10:
+                                dumps_found_text += f"\n... and {len(dump_files) - 10} more dump files.\n"
+                                
+                            dumps_found_text += "\nYou can analyze one of these dumps by specifying its path."
+                    
+                    return [TextContent(
+                        type="text",
+                        text=f"Please provide a path to a crash dump file to analyze.{dumps_found_text}\n\n"
+                              f"You can use the 'list_windbg_dumps' tool to discover available crash dumps."
+                    )]
+                
                 args = OpenWindbgDump(**arguments)
                 session = get_or_create_session(
                     args.dump_path, cdb_path, symbols_path, timeout, verbose
@@ -239,6 +286,14 @@ async def serve(
             elif name == "list_windbg_dumps":
                 args = ListWindbgDumpsParams(**arguments)
                 
+                if args.directory_path is None:
+                    args.directory_path = get_local_dumps_path()
+                    if args.directory_path is None:
+                        raise McpError(ErrorData(
+                            code=INVALID_PARAMS,
+                            message="No directory path specified and no default dump path found in registry."
+                        ))
+                
                 if not os.path.exists(args.directory_path) or not os.path.isdir(args.directory_path):
                     raise McpError(ErrorData(
                         code=INVALID_PARAMS,
@@ -266,11 +321,8 @@ async def serve(
                     # Get file size in MB
                     try:
                         size_mb = round(os.path.getsize(dump_file) / (1024 * 1024), 2)
-                        modified_time = os.path.getmtime(dump_file)
-                        modified_str = f"Modified: {os.path.getmtime(dump_file)}"
                     except (OSError, IOError):
                         size_mb = "unknown"
-                        modified_str = "Modified: unknown"
                     
                     result_text += f"{i+1}. {dump_file} ({size_mb} MB)\n"
                 
