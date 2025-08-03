@@ -5,6 +5,7 @@ import winreg
 from typing import Dict, Optional
 
 from .cdb_session import CDBSession, CDBError
+from .windbg_session import WinDbgSession
 
 from mcp.shared.exceptions import McpError
 from mcp.server import Server
@@ -50,9 +51,27 @@ class OpenWindbgDump(BaseModel):
     include_threads: bool = Field(description="Whether to include thread information")
 
 
+class AttachWindbgParams(BaseModel):
+    """Attach to an already-running WinDbg instance that has
+    windbg_mcp_plugin.js loaded and initialised with mcp_init.
+    """
+    timeout: int | None = Field(
+        default=None,
+        description="Optional timeout (in seconds) to wait for the attach handshake."
+    )
+    verbose: bool = Field(
+        default=False,
+        description="Emit verbose logging during the attach process."
+    )
+
+
 class RunWindbgCmdParams(BaseModel):
     """Parameters for executing a WinDBG command."""
-    dump_path: str = Field(description="Path to the Windows crash dump file")
+    dump_path: Optional[str] = Field(
+        default=None,
+        description=("Path to the dump file *when talking to CDB*.  "
+                     "Omit this when you have previously called `attach_windbg`.")
+    )
     command: str = Field(description="WinDBG command to execute")
 
 
@@ -137,6 +156,60 @@ def execute_common_analysis_commands(session: CDBSession) -> dict:
     return results
 
 
+# -----------------------------------------------------------------
+# Attach to a running WinDbg-JS session
+# -----------------------------------------------------------------
+def handle_attach_windbg(
+    arguments: dict,
+    *,
+    timeout: int,
+    verbose: bool,
+) -> list[TextContent]:
+    """
+    Attach to an existing WinDbg instance that has `windbg_mcp_plugin.js`
+    loaded and initialised with `mcp_init`.
+
+    The JS plug-in drops a temp JSON file (windbg_mcp_<id>.json) that the
+    Python side polls for; creating a WinDbgSession with dump_path=None
+    triggers that handshake.
+    """
+    # WinDbg support may be optional – fail gracefully if the import failed
+    if WinDbgSession is None:                                   # set in the top-level try/except
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message="WinDbg support is not available (WinDbgSession import failed)"
+        ))
+
+    # Parse optional params (timeout / verbose) – both are optional
+    params = AttachWindbgParams(**arguments)
+
+    # Always use the same key in the registry so we re-use the session
+    key = "__windbg_attach__"
+
+    try:
+        if key not in active_sessions or active_sessions[key] is None:
+            # Create a *new* attach-mode session (dump_path=None)
+            session = WinDbgSession(
+                dump_path=None,
+                timeout=params.timeout or timeout,
+                verbose=params.verbose or verbose,
+            )
+            active_sessions[key] = session
+        else:
+            session = active_sessions[key]
+
+        banner = (
+            f"[V] Attached to WinDbg session **{getattr(session, 'session_id', 'unknown')}**\n\n"
+            f"You can now use `run_windbg_cmd` to execute debugger commands."
+        )
+        return [TextContent(type="text", text=banner)]
+
+    except Exception as e:                                      # pragma: no cover
+        raise McpError(ErrorData(
+            code=INTERNAL_ERROR,
+            message=f"Failed to attach to WinDbg: {e}"
+        ))
+
 async def serve(
     cdb_path: Optional[str] = None,
     symbols_path: Optional[str] = None,
@@ -163,6 +236,16 @@ async def serve(
                 This tool executes common WinDBG commands to analyze the crash dump and returns the results.
                 """,
                 inputSchema=OpenWindbgDump.model_json_schema(),
+            ),
+            Tool(
+                name="attach_windbg",
+                description="""
+                Attach to a live WinDbg session that has 'windbg_mcp_plugin.js' loaded
+                and initialised (via mcp_init).  Use this when you already have WinDbg
+                open with a dump, TTD trace, or live target and simply want the MCP
+                server to talk to that session instead of launching CDB.
+                """,
+                inputSchema=AttachWindbgParams.model_json_schema(),
             ),
             Tool(
                 name="run_windbg_cmd",
@@ -256,12 +339,33 @@ async def serve(
                     type="text",
                     text="".join(results)
                 )]
-                
+
+            elif name == "attach_windbg":
+                return handle_attach_windbg(
+                    arguments,
+                    timeout=timeout,
+                    verbose=verbose,
+                )
+
             elif name == "run_windbg_cmd":
                 args = RunWindbgCmdParams(**arguments)
-                session = get_or_create_session(
-                    args.dump_path, cdb_path, symbols_path, timeout, verbose
-                )
+                # ── decide which engine we target ─────────────────────────────
+                if args.dump_path:
+                    # Classic CDB flow (keyed by dump path)
+                    session = get_or_create_session(
+                        args.dump_path, cdb_path, symbols_path, timeout, verbose
+                    )
+                else:
+                    # No dump_path -> expect exactly one attached WinDbg session
+                    key = "__windbg_attach__"
+                    session = active_sessions.get(key)
+                    if session is None:
+                        raise McpError(ErrorData(
+                            code=INVALID_PARAMS,
+                            message=("No dump_path provided and no active WinDbg "
+                                     "attachment found.  Call `attach_windbg` first "
+                                     "or supply a dump_path.")
+                        ))
                 output = session.send_command(args.command)
                 
                 return [TextContent(
