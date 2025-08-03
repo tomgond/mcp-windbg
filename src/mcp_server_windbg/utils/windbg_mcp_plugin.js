@@ -65,7 +65,6 @@ function readFileText(reader) {
 
 function readJson(path) {
     const fs = host.namespace.Debugger.Utility.FileSystem;
-    dbg(`readJson ← ${path}`);
 
     if (!fs.FileExists(path)) {
         dbg("readJson → file not found (return null)");
@@ -78,19 +77,18 @@ function readJson(path) {
         const reader = fs.CreateTextReader(file, "Utf8");
         const txt = readFileText(reader).trim();
         if (!txt) {
-            dbg("readJson → empty file (return null)");
+            dbg("readJson -> empty file (return null)");
             return null;
         }
         try {
             const obj = JSON.parse(txt);
-            dbg("readJson ✔ parsed OK");
             return obj;
         } catch (e) {
-            dbg(`readJson ✖ JSON parse error: ${e.message}`);
+            dbg(`readJson -> JSON parse error: ${e.message}`);
             return null;
         }
     } catch (e) {
-        dbg(`readJson ✖ ERROR: ${e.message}`);
+        dbg(`readJson [X] ERROR: ${e.message}`);
         return null;
     } finally {
         if (file) file.Close();
@@ -151,23 +149,28 @@ function executeDbg(cmd, id) {
 function pollOnce() {
     const msg = readJson(g.commFile);
     if (!msg) return;
-
-    dbg(`pollOnce: got message id=${msg.id}, type=${msg.type}`);
-
     if (msg.type === "command" && msg.id !== g.lastProcessedId) {
         g.lastProcessedId = msg.id;
+        dbg(`pollOnce: got message id=${msg.id}, type=${msg.type}`);
         executeDbg(msg.command, msg.id);
     }
 }
 
-function monitorLoop(maxCycles = 2) {
+function monitorLoop() {
     if (g.monitorRunning) return;
     g.monitorRunning = true;
     const ctl = host.namespace.Debugger.Utility.Control;
-    dbg(`monitorLoop started, will run ${maxCycles} cycles …`);
+    dbg(`monitorLoop started`);
 
     let cycles = 0;
-    while (g.monitorRunning && cycles < maxCycles) {
+    while (g.monitorRunning) {
+        /* external shutdown marker from Python? */
+        if (g.shutdownFile &&
+            host.namespace.Debugger.Utility.FileSystem.FileExists(g.shutdownFile)) {
+            dbg("shutdown file detected – stopping");
+            mcp_shutdown();
+            break;
+        }
         try {
             pollOnce();
         } catch (e) {
@@ -200,7 +203,7 @@ function mcp_init() {
     });
     g.isInit = true;
 
-    monitorLoop(1000);
+    monitorLoop();
     return `MCP ready (session ${g.sessionId})`;
 }
 
