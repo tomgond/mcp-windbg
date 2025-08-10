@@ -102,6 +102,10 @@ class CloseWindbgRemoteParams(BaseModel):
     """Parameters for closing a remote debugging connection."""
     connection_string: str = Field(description="Remote connection string to close")
 
+class CloseWindbgAttachParams(BaseModel):
+    """Parameters for disconnecting from an attached WinDbg (.js) session."""
+    # intentionally empty – we close the single attached session keyed by __windbg_attach__
+    pass
 
 class ListWindbgDumpsParams(BaseModel):
     """Parameters for listing crash dumps in a directory."""
@@ -156,18 +160,22 @@ def get_or_create_session(
     return active_sessions[session_id]
 
 
-def unload_session(dump_path: Optional[str] = None, connection_string: Optional[str] = None) -> bool:
+def unload_session(dump_path: Optional[str] = None,
+                   connection_string: Optional[str] = None,
+                   is_windbg_attach: Optional[bool] = None) -> bool:
     """Unload and clean up a CDB session."""
-    if not dump_path and not connection_string:
+    if not dump_path and not connection_string and not is_windbg_attach:
         return False
-    if dump_path and connection_string:
+    if sum(x is not None for x in (dump_path, connection_string, is_windbg_attach)) > 1:
         return False
     
     # Create session identifier
     if dump_path:
         session_id = os.path.abspath(dump_path)
-    else:
+    elif connection_string:
         session_id = f"remote:{connection_string}"
+    else:
+        session_id = "__windbg_attach__"
 
     if session_id in active_sessions and active_sessions[session_id] is not None:
         try:
@@ -321,6 +329,15 @@ async def serve(
                 Use this tool when you're done with a remote debugging session to free up resources.
                 """,
                 inputSchema=CloseWindbgRemoteParams.model_json_schema(),
+            ),
+            Tool(
+                name="close_windbg_attach",
+                description="""
+                Disconnect from a live WinDbg session previously attached with 'attach_windbg'.
+                This signals the JS plugin to shut down (via a _shutdown.json) and clears
+                the server-side session cache.
+                """,
+                inputSchema=CloseWindbgAttachParams.model_json_schema(),
             ),
             Tool(
                 name="list_windbg_dumps",
@@ -481,6 +498,21 @@ async def serve(
             elif name == "close_windbg_remote":
                 args = CloseWindbgRemoteParams(**arguments)
                 success = unload_session(connection_string=args.connection_string)
+                if success:
+                    return [TextContent(
+                        type="text",
+                        text=f"Successfully closed remote connection: {args.connection_string}"
+                    )]
+                else:
+                    return [TextContent(
+                        type="text",
+                        text=f"No active session found for remote connection: {args.connection_string}"
+                    )]
+
+            elif name == "close_windbg_attach":
+                # no args needed; keep the parsing for symmetry/validation
+                _ = CloseWindbgAttachParams(**arguments)
+                success = unload_session("__windbg_attach__")
                 if success:
                     return [TextContent(
                         type="text",
